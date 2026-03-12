@@ -3,8 +3,8 @@ import pandas as pd
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
-DATA_PATH = CURRENT_DIR.parent / "Traduction_avis_clients"
-def read_dataset(n:int=35):
+DATA_PATH = CURRENT_DIR.parent / "data"
+def read_dataset(n:int=35) -> list[pd.DataFrame]:
     dataset_list = []
     for i in range(1,n + 1):
         try:
