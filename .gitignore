@@ -213,3 +213,6 @@ __marimo__/
 #  Dataset
 *.xlsx
 *.csv
+
+
+.DS_Store
