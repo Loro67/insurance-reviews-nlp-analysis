@@ -214,8 +214,8 @@ __marimo__/
 *.xlsx
 *.csv
 
-# Model folder
+# folder
 model/
-
+logs/
 
 .DS_Store
