@@ -211,6 +211,8 @@ __marimo__/
 
 
 #  Dataset
+/data/
+*.parquet
 *.xlsx
 *.csv
 
