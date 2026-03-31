@@ -7,82 +7,115 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 import config as cfg
 from utils.ui_helpers import (
-    page_header, metric_card, probability_chart, info_box, empty_state,
-    star_rating_badge, PRIMARY, ACCENT_GREEN, ACCENT_RED,
+    page_header,
+    metric_card,
+    probability_chart,
+    info_box,
+    star_rating_badge,
+    PRIMARY,
+    ACCENT_GREEN,
+    ACCENT_RED,
 )
-from utils.model_loader import load_classifier, load_bert_sentiment_pipeline
-from utils.preprocessing import clean_text, prepare_for_tfidf
+from utils.model_loader import (
+    load_classifier,
+    load_theme_classifier,
+    load_bert_sentiment_pipeline,
+    load_translation_pipeline,
+)
+from utils.preprocessing import prepare_for_tfidf
 
 
 def predict_with_lr(text: str, tfidf, clf):
     """Run TF-IDF + LR inference on raw text. Returns (label_0idx, probs array)."""
     cleaned = prepare_for_tfidf(text)
-    vec     = tfidf.transform([cleaned])
-    probs   = clf.predict_proba(vec)[0]
-    pred    = int(np.argmax(probs))
+    vec = tfidf.transform([cleaned])
+    probs = clf.predict_proba(vec)[0]
+    pred = int(np.argmax(probs))
     return pred, probs
 
 
 def predict_with_bert(text: str, pipe):
     """Run BERT multilingual sentiment inference. Returns (label_0idx, probs array)."""
     truncated = " ".join(text.split()[:400])
-    result    = pipe(truncated, truncation=True, max_length=512)[0]
-    label_str = result["label"]
-    score     = result["score"]
+    result = pipe(truncated, truncation=True, max_length=512)[0]
+    label_idx = int(result["label"].split()[0]) - 1
+    score = result["score"]
 
-    # BERT model outputs "1 star" … "5 stars"
-    label_idx = int(label_str.split()[0]) - 1   # → 0…4
-
-    # Approximate probability distribution (peak at predicted, distribute rest)
     probs = np.full(5, (1 - score) / 4)
     probs[label_idx] = score
     return label_idx, probs
 
 
+def predict_theme(text: str, tfidf, clf):
+    cleaned = prepare_for_tfidf(text)
+    vec = tfidf.transform([cleaned])
+    probs = clf.predict_proba(vec)[0]
+    pred_idx = int(np.argmax(probs))
+    labels = list(clf.classes_)
+    return labels[pred_idx], labels, probs
+
+
+def translate_french_input(text: str, translator) -> str:
+    translated = translator(text[:1000], max_length=512, truncation=True)
+    return translated[0]["translation_text"].strip()
+
+
+def sentiment_from_star(star: int):
+    if star <= 2:
+        return "Negative", ACCENT_RED
+    if star == 3:
+        return "Neutral", "#FB8C00"
+    return "Positive", ACCENT_GREEN
+
+
 def render():
-    page_header(
-        "", "Prediction",
-    )
+    page_header("", "Prediction")
 
-    with st.spinner("Loading classifier …"):
-        tfidf, clf = load_classifier()
+    with st.spinner("Loading local models ..."):
+        tfidf_rating, clf_rating = load_classifier()
+        tfidf_theme, clf_theme = load_theme_classifier()
 
-    model_available = tfidf is not None and clf is not None
-    bert_pipe       = None
+    model_available = tfidf_rating is not None and clf_rating is not None
+    theme_available = tfidf_theme is not None and clf_theme is not None
+    bert_pipe = None
 
     if not model_available:
         info_box(
-            "Local TF-IDF + LR classifier not found. "
-            "Falling back to <b>BERT multilingual</b> sentiment model. "
-            "Re-train and export <code>lr_classifier_en.pkl</code> from notebook 5 "
-            "to use the faster local model.",
+            "Local rating classifier not found. Falling back to multilingual BERT for "
+            "rating only until notebook 5 exports `lr_tfidf_en.pkl` and `lr_rating_en.pkl`.",
             kind="warning",
         )
-        with st.spinner("Loading BERT fallback model …"):
+        with st.spinner("Loading BERT fallback model ..."):
             bert_pipe = load_bert_sentiment_pipeline()
+
+    if not theme_available:
+        info_box(
+            "Local theme classifier not found. Run notebook 5 to export "
+            "`tfidf_theme_en.pkl` and `lr_theme_en.pkl` for subject detection.",
+            kind="warning",
+        )
 
     if not model_available and bert_pipe is None:
         info_box(
-            "No classifier available. Please run notebook 5 and export the model.",
+            "No rating classifier is available. Please export the Step 5 models first.",
             kind="error",
         )
         return
 
-    # ── Input ─────────────────────────────────────────────────────────────────
     st.markdown("#### Enter a review")
     example_texts = {
         "— choose an example —": "",
-        "Negative (1★)": (
-            "Très déçu par ce service. Ma réclamation a été refusée sans raison valable. "
-            "Le service client ne répond pas aux emails. Je déconseille fortement cette assurance."
+        "Claims issue": (
+            "My claim was refused after weeks of waiting. Customer service kept asking for the "
+            "same documents and nobody could explain the decision."
         ),
-        "Neutral (3★)": (
-            "L'assurance est correcte dans l'ensemble. Les remboursements prennent un peu de temps "
-            "mais arrivent finalement. Le prix a augmenté cette année ce qui est dommage."
+        "Pricing complaint": (
+            "The premium increased again this year and the coverage is worse than before. "
+            "It is becoming too expensive for the value provided."
         ),
-        "Positive (5★)": (
-            "Excellent service ! Ma réclamation a été traitée en 48 heures. "
-            "Le conseiller était très professionnel et à l'écoute. Je recommande vivement."
+        "Positive service": (
+            "Very satisfied with this insurer. Fast reimbursement, clear communication and a "
+            "simple subscription process. I would recommend them."
         ),
     }
 
@@ -90,14 +123,13 @@ def render():
     with col_ex:
         selected = st.selectbox("Load an example", list(example_texts.keys()))
     with col_lang:
-        lang = st.radio("Language hint", ["French", "English"], horizontal=True)
+        language_hint = st.radio("Input language", ["French", "English"], index=1, horizontal=True)
 
-    default_text = example_texts[selected]
-    user_text    = st.text_area(
+    user_text = st.text_area(
         "Review text",
-        value=default_text,
-        height=150,
-        placeholder="Paste or type your review here …",
+        value=example_texts[selected],
+        height=160,
+        placeholder="Paste or type your review here ...",
         label_visibility="collapsed",
     )
 
@@ -106,37 +138,48 @@ def render():
         unsafe_allow_html=True,
     )
 
-    # ── Predict ───────────────────────────────────────────────────────────────
-    btn = st.button("Predict Rating", type="primary", use_container_width=True)
-
-    if btn:
+    if st.button("Predict Rating and Subject", type="primary", use_container_width=True):
         if len(user_text.strip()) < cfg.MIN_REVIEW_CHARS:
-            info_box(f"Please enter at least {cfg.MIN_REVIEW_CHARS} characters.", kind="warning")
+            info_box(
+                f"Please enter at least {cfg.MIN_REVIEW_CHARS} characters.",
+                kind="warning",
+            )
             return
 
-        with st.spinner("Running inference …"):
+        with st.spinner("Running local inference ..."):
             try:
+                inference_text = user_text
+                translated_text = None
+                if language_hint == "French":
+                    translator = load_translation_pipeline()
+                    if translator is None:
+                        info_box(
+                            "The translation model could not be loaded, so French input cannot be "
+                            "processed right now.",
+                            kind="error",
+                        )
+                        return
+                    translated_text = translate_french_input(user_text, translator)
+                    inference_text = translated_text
+
                 if model_available:
-                    pred_idx, probs = predict_with_lr(user_text, tfidf, clf)
+                    pred_idx, probs = predict_with_lr(inference_text, tfidf_rating, clf_rating)
                     model_name = "TF-IDF + Logistic Regression"
                 else:
-                    pred_idx, probs = predict_with_bert(user_text, bert_pipe)
-                    model_name = "BERT multilingual (fallback)"
+                    pred_idx, probs = predict_with_bert(inference_text, bert_pipe)
+                    model_name = "BERT multilingual fallback"
 
-                star      = pred_idx + 1
+                star = pred_idx + 1
                 confidence = float(probs[pred_idx])
+                sentiment, sent_color = sentiment_from_star(star)
 
-                # Sentiment bucket
-                if star <= 2:
-                    sentiment = "Negative"
-                    sent_color = ACCENT_RED
-                elif star == 3:
-                    sentiment = "Neutral"
-                    sent_color = "#FB8C00"
-                else:
-                    sentiment = "Positive"
-                    sent_color = ACCENT_GREEN
-
+                pred_theme = "Unavailable"
+                theme_labels = []
+                theme_probs = np.array([])
+                if theme_available:
+                    pred_theme, theme_labels, theme_probs = predict_theme(
+                        inference_text, tfidf_theme, clf_theme
+                    )
             except Exception as e:
                 info_box(f"Prediction error: {e}", kind="error")
                 return
@@ -144,27 +187,46 @@ def render():
         st.divider()
         st.markdown("### Results")
 
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
             metric_card("Predicted Rating", star_rating_badge(star), color=PRIMARY)
         with col2:
             metric_card("Confidence", f"{confidence*100:.1f}%", color=PRIMARY)
         with col3:
             metric_card("Sentiment", sentiment, color=sent_color)
+        with col4:
+            metric_card("Predicted Subject", pred_theme, color=PRIMARY)
 
-        # Probability distribution chart
         star_labels = [f"{i} star{'s' if i > 1 else ''}" for i in range(1, 6)]
-        probability_chart(star_labels, probs.tolist(), "Class Probability Distribution")
+        probability_chart(star_labels, probs.tolist(), "Rating Probability Distribution")
 
-        # Model info
+        if theme_available and len(theme_labels) == len(theme_probs):
+            with st.expander("Subject probabilities", expanded=True):
+                order = np.argsort(theme_probs)[::-1]
+                ordered_labels = [str(theme_labels[i]) for i in order]
+                ordered_probs = [float(theme_probs[i]) for i in order]
+                probability_chart(
+                    ordered_labels,
+                    ordered_probs,
+                    "Theme Probability Distribution",
+                )
+
+        if language_hint == "French" and translated_text:
+            with st.expander("English text used for the model"):
+                st.markdown(translated_text)
+
         with st.expander("Model details"):
-            st.markdown(f"**Model:** {model_name}")
-            st.markdown("**Pipeline:** clean text → tokenize → TF-IDF transform → LR predict")
-            st.markdown("**Training task:** 5-class star rating prediction (0-indexed classes 0–4)")
-            prob_df_data = {
-                "Rating": [f"{i} stars" for i in range(1, 6)],
-                "Probability": [f"{p:.4f}" for p in probs],
-                "Percentage":  [f"{p*100:.2f}%" for p in probs],
-            }
-            import pandas as pd
-            st.dataframe(pd.DataFrame(prob_df_data), hide_index=True, use_container_width=True)
+            st.markdown(f"**Rating model:** {model_name}")
+            if theme_available:
+                st.markdown("**Subject model:** TF-IDF + Logistic Regression on `theme_enriched`")
+            else:
+                st.markdown("**Subject model:** unavailable")
+            if language_hint == "French":
+                st.markdown(
+                    "**Input handling:** French reviews are translated to English first, then "
+                    "passed to the local rating and subject classifiers."
+                )
+            st.markdown(
+                "**Pipeline:** clean text -> TF-IDF transform -> local classifier(s) -> "
+                "real-time rating, sentiment, and subject prediction"
+            )

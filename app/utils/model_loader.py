@@ -16,14 +16,123 @@ sys.path.append(str(Path(__file__).parent.parent))
 import config as cfg
 
 
+class _LocalSeq2SeqGenerator:
+    """Lightweight seq2seq wrapper for summarization / translation across transformers versions."""
+
+    def __init__(self, model_name: str, output_key: str):
+        import torch
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+        self._torch = torch
+        self.output_key = output_key
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        self.model.eval()
+
+    def __call__(self, text, max_length: int = 128, min_length: int = 0,
+                 truncation: bool = True, do_sample: bool = False, **kwargs):
+        if isinstance(text, list):
+            text = text[0] if text else ""
+        text = str(text or "").strip()
+        if not text:
+            return [{self.output_key: ""}]
+
+        inputs = self.tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=truncation,
+            max_length=512,
+        )
+        with self._torch.no_grad():
+            generated = self.model.generate(
+                **inputs,
+                max_length=max_length,
+                min_length=max(min_length, 0),
+                do_sample=do_sample,
+            )
+        decoded = self.tokenizer.batch_decode(generated, skip_special_tokens=True)
+        return [{self.output_key: decoded[0].strip() if decoded else ""}]
+
+
+class _LocalQuestionAnswerer:
+    """Local extractive QA wrapper that does not depend on the deprecated pipeline task registry."""
+
+    def __init__(self, model_name: str):
+        import torch
+        from transformers import AutoModelForQuestionAnswering, AutoTokenizer
+
+        self._torch = torch
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForQuestionAnswering.from_pretrained(model_name)
+        self.model.eval()
+
+    def __call__(self, question: str, context: str):
+        question = str(question or "").strip()
+        context = str(context or "").strip()
+        if not question or not context:
+            return {"answer": "", "score": 0.0, "start": 0, "end": 0}
+
+        encoded = self.tokenizer(
+            question,
+            context,
+            return_tensors="pt",
+            truncation="only_second",
+            max_length=512,
+            return_offsets_mapping=True,
+        )
+        offset_mapping = encoded.pop("offset_mapping")[0].tolist()
+        sequence_ids = encoded.sequence_ids(0)
+
+        with self._torch.no_grad():
+            outputs = self.model(**encoded)
+
+        start_probs = self._torch.softmax(outputs.start_logits[0], dim=-1)
+        end_probs = self._torch.softmax(outputs.end_logits[0], dim=-1)
+
+        candidate_starts = [
+            idx for idx in self._torch.argsort(start_probs, descending=True).tolist()
+            if idx < len(sequence_ids) and sequence_ids[idx] == 1
+        ][:20]
+        candidate_ends = [
+            idx for idx in self._torch.argsort(end_probs, descending=True).tolist()
+            if idx < len(sequence_ids) and sequence_ids[idx] == 1
+        ][:20]
+
+        best = None
+        best_score = 0.0
+        for start_idx in candidate_starts:
+            for end_idx in candidate_ends:
+                if end_idx < start_idx or end_idx - start_idx > 30:
+                    continue
+                start_char, _ = offset_mapping[start_idx]
+                _, end_char = offset_mapping[end_idx]
+                if end_char <= start_char:
+                    continue
+                score = float(start_probs[start_idx] * end_probs[end_idx])
+                if score > best_score:
+                    best_score = score
+                    best = (start_char, end_char)
+
+        if best is None:
+            return {"answer": "", "score": 0.0, "start": 0, "end": 0}
+
+        start_char, end_char = best
+        answer = context[start_char:end_char].strip()
+        return {
+            "answer": answer,
+            "score": best_score,
+            "start": start_char,
+            "end": end_char,
+        }
+
+
 @st.cache_data(show_spinner=False)
 def load_dataset() -> pd.DataFrame:
     """Load the review dataset with strict format handling."""
     path = cfg.CLEANED_DATA
-    # Système de fallback si le fichier principal n'existe pas
     if not path.exists():
-        for fallback in ["reviews_step2.parquet"]:
-            p = cfg.DATA_DIR / fallback
+        for fallback in [cfg.STEP4_DATA, cfg.STEP2_DATA]:
+            p = fallback
             if p.exists():
                 path = p
                 break
@@ -32,19 +141,16 @@ def load_dataset() -> pd.DataFrame:
             return pd.DataFrame()
 
     try:
-        # 1. Si c'est un fichier Parquet
         if path.suffix == ".parquet":
             df = pd.read_parquet(path)
-    
-        # --- Nettoyage post-chargement ---
+
         for col in [cfg.COL_TEXT_EN, cfg.COL_TEXT_FR, cfg.COL_INSURER]:
             if col in df.columns:
                 df[col] = df[col].fillna("").astype(str)
-        
-        # S'assurer que la colonne de résumé du Notebook Step 2 existe
+
         if "avis_summary" in df.columns:
             df[cfg.COL_SUMMARY] = df["avis_summary"]
-        
+
         return df
 
     except Exception as e:
@@ -59,25 +165,20 @@ def load_insurer_summaries() -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame(columns=["assureur", "summary_overall",
                                       "summary_complaints", "avg_rating", "n_reviews"])
-    
-    # Liste des encodages et séparateurs à tester
+
     encodings = ['utf-8', 'latin-1']
-    separators = [',', ';', '\t'] # Virgule, Point-virgule, Tabulation
+    separators = [',', ';', '\t']
 
     for enc in encodings:
         for sep in separators:
             try:
-                # On essaie de lire un petit morceau pour vérifier la structure
                 df = pd.read_csv(path, encoding=enc, sep=sep)
-                
-                # Vérification critique : est-ce que les colonnes attendues sont là ?
-                # Si le séparateur est mauvais, on aura souvent une seule colonne avec un nom bizarre
+
                 if "assureur" in df.columns or "summary_overall" in df.columns:
                     return df
             except Exception:
                 continue
-                
-    # Si tout a échoué, on essaie une lecture brute très permissive
+
     try:
         return pd.read_csv(path, sep=None, engine='python', encoding='latin-1')
     except Exception as e:
@@ -103,19 +204,27 @@ def load_tfidf_vectorizers() -> Tuple[Optional[object], Optional[object]]:
     return tfidf_en, tfidf_fr
 
 @st.cache_resource(show_spinner=False)
-def load_classifier() -> Tuple[Optional[object], Optional[object]]:
+def load_classifier(lang: str = "en") -> Tuple[Optional[object], Optional[object]]:
     """
     Load the TF-IDF + LR classifier saved from Step 5.
 
     Returns (tfidf, classifier) or (None, None) if not found.
     The app will fall back to a live HuggingFace BERT pipeline if missing.
     """
-    # Try dedicated classifier pkl first
-    for tfidf_path, clf_path in [
-        (cfg.LR_TFIDF_EN, cfg.LR_CLASSIFIER_EN),
-        # Backward-compatibility names exported by older notebooks
-        (cfg.MODEL_DIR / "tfidf_en.pkl", cfg.MODEL_DIR / "lr_rating_en.pkl"),
-    ]:
+    lang = (lang or "en").lower()
+    candidates = []
+    if lang == "fr":
+        candidates = [
+            (cfg.LR_TFIDF_FR, cfg.LR_CLASSIFIER_FR),
+            (cfg.MODEL_DIR / "tfidf_fr.pkl", cfg.MODEL_DIR / "lr_rating_fr.pkl"),
+        ]
+    else:
+        candidates = [
+            (cfg.LR_TFIDF_EN, cfg.LR_CLASSIFIER_EN),
+            (cfg.MODEL_DIR / "tfidf_en.pkl", cfg.MODEL_DIR / "lr_rating_en.pkl"),
+        ]
+
+    for tfidf_path, clf_path in candidates:
         if tfidf_path.exists() and clf_path.exists():
             try:
                 with open(tfidf_path, "rb") as f:
@@ -126,7 +235,23 @@ def load_classifier() -> Tuple[Optional[object], Optional[object]]:
             except Exception:
                 pass
 
-    # Fallback: use the Step-3 TF-IDF + rebuild a thin LR from dataset
+    return None, None
+
+
+@st.cache_resource(show_spinner=False)
+def load_theme_classifier(lang: str = "en") -> Tuple[Optional[object], Optional[object]]:
+    """Load the TF-IDF + LR theme classifier exported from Step 5."""
+    if (lang or "en").lower() != "en":
+        return None, None
+    if cfg.LR_THEME_TFIDF_EN.exists() and cfg.LR_THEME_CLASSIFIER_EN.exists():
+        try:
+            with open(cfg.LR_THEME_TFIDF_EN, "rb") as f:
+                tfidf = pickle.load(f)
+            with open(cfg.LR_THEME_CLASSIFIER_EN, "rb") as f:
+                clf = pickle.load(f)
+            return tfidf, clf
+        except Exception:
+            pass
     return None, None
 
 
@@ -152,15 +277,35 @@ def load_summarizer():
     """Load the DistilBART summarization pipeline."""
     try:
         from transformers import pipeline
-        pipe = pipeline(
-            "summarization",
-            model=cfg.SUMMARIZER_MODEL,
-            framework="pt",
-            device=-1,
-        )
-        return pipe
+        try:
+            return pipeline(
+                "summarization",
+                model=cfg.SUMMARIZER_MODEL,
+                framework="pt",
+                device=-1,
+            )
+        except KeyError:
+            return _LocalSeq2SeqGenerator(cfg.SUMMARIZER_MODEL, "summary_text")
     except Exception as e:
         st.warning(f"Could not load summarization model: {e}")
+        return None
+
+@st.cache_resource(show_spinner=False)
+def load_translation_pipeline():
+    """Load the French-to-English translation pipeline used by the app."""
+    try:
+        from transformers import pipeline
+        try:
+            return pipeline(
+                "translation",
+                model=cfg.TRANSLATION_MODEL,
+                framework="pt",
+                device=-1,
+            )
+        except KeyError:
+            return _LocalSeq2SeqGenerator(cfg.TRANSLATION_MODEL, "translation_text")
+    except Exception as e:
+        st.warning(f"Could not load translation model: {e}")
         return None
 
 @st.cache_resource(show_spinner=False)
@@ -168,13 +313,15 @@ def load_qa_pipeline():
     """Load the extractive QA pipeline (RoBERTa-SQuAD2)."""
     try:
         from transformers import pipeline
-        pipe = pipeline(
-            "question-answering",
-            model=cfg.QA_MODEL,
-            framework="pt",
-            device=-1,
-        )
-        return pipe
+        try:
+            return pipeline(
+                "question-answering",
+                model=cfg.QA_MODEL,
+                framework="pt",
+                device=-1,
+            )
+        except KeyError:
+            return _LocalQuestionAnswerer(cfg.QA_MODEL)
     except Exception as e:
         st.warning(f"Could not load QA model: {e}")
         return None

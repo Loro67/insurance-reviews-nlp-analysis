@@ -142,7 +142,8 @@ def render():
 
     if tfidf is None or clf is None:
         info_box(
-            "The TF-IDF + LR classifier (<code>lr_classifier_en.pkl</code>) is required ",
+            "The TF-IDF + LR rating artifacts (<code>lr_tfidf_en.pkl</code> and "
+            "<code>lr_rating_en.pkl</code>) are required.",
             kind="error",
         )
         return

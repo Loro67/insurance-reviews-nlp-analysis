@@ -11,14 +11,13 @@ shap>=0.44.0             # XAI (optional but recommended)
 
 # ─── NLP & Embeddings ─────────────────────────────────────────────────────────
 gensim>=4.3.0            # Word2Vec
-transformers>=4.40.0     # BERT, DistilBART, RoBERTa, Helsinki-NLP
+transformers>=4.40.0,<5.0.0  # BERT, DistilBART, RoBERTa, Helsinki-NLP
 torch>=2.0.0             # PyTorch backend for HuggingFace
 sentencepiece>=0.1.99    # Required for Helsinki-NLP translation
 sacremoses>=0.1.1        # Tokenizer for translation model
 
 # ─── RAG / LLM ────────────────────────────────────────────────────────────────
 openai>=1.10.0           # OpenAI-compatible client (works with Ollama too)
-google-generativeai>=0.7.0
 # ─── Visualization ────────────────────────────────────────────────────────────
 plotly>=5.18.0           # Interactive charts in Streamlit
 

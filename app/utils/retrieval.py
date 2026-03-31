@@ -8,6 +8,22 @@ import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 
 
+def _get_search_texts(df: pd.DataFrame, text_col: str) -> pd.Series:
+    """Prefer pre-tokenized text so retrieval matches the fitted vectorizer vocabulary."""
+    def normalize_tokens(value) -> str:
+        if isinstance(value, (list, tuple, np.ndarray)):
+            return " ".join(str(token) for token in value if str(token).strip())
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return ""
+        return str(value)
+
+    if text_col == "avis_cor_en" and "tokens_en" in df.columns:
+        return df["tokens_en"].apply(normalize_tokens)
+    if text_col == "avis_cor" and "tokens_fr" in df.columns:
+        return df["tokens_fr"].apply(normalize_tokens)
+    return df[text_col].fillna("").astype(str)
+
+
 def tfidf_search(
     query: str,
     df: pd.DataFrame,
@@ -37,10 +53,8 @@ def tfidf_search(
     if not clean_query.strip():
         return pd.DataFrame()
 
-    # Vectorize corpus (on the fly — use cached matrix if possible)
-    texts = df[text_col].fillna("").astype(str)
+    texts = _get_search_texts(df, text_col)
 
-    # We only vectorize if the vectorizer's vocabulary covers these texts
     try:
         corpus_matrix = tfidf_vectorizer.transform(texts)
         query_vec     = tfidf_vectorizer.transform([clean_query])
@@ -90,7 +104,7 @@ def bm25_search(
     if not query_tokens:
         return pd.DataFrame()
 
-    corpus = df[text_col].fillna("").astype(str).tolist()
+    corpus = _get_search_texts(df, text_col).tolist()
     tokenized = [simple_tokenize(doc) for doc in corpus]
 
     # Document frequencies
@@ -146,7 +160,7 @@ def embedding_search(
     from utils.preprocessing import simple_tokenize
 
     if corpus_vectors is None or w2v_model is None:
-        return tfidf_search(query, df, "avis_cor_en", top_k=top_k)
+        return keyword_search(query, df, "avis_cor_en", top_k=top_k)
 
     tokens = simple_tokenize(query)
     wv     = w2v_model.wv
