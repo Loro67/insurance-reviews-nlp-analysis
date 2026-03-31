@@ -73,7 +73,7 @@ Run the notebooks in this order:
 2. `notebooks/2_summary_translation_qa_generation.ipynb`
 3. `notebooks/3_topic_modeling.ipynb`
 4. `notebooks/4_embeddings.ipynb`
-5. `notebooks/step5_supervised_learning.ipynb`
+5. `notebooks/5_supervised_learning.ipynb`
 
 This sequence produces the parquet files, model artifacts, TensorBoard logs, and comparison plots used in the app.
 
@@ -97,4 +97,3 @@ The app includes these pages:
 - The `RAG` page is the only page that may require an external API.
 - You can configure the `RAG` page with `OPENAI_API_KEY`, `OPENAI_API_BASE`, and `RAG_LLM_MODEL`.
 - The `Question Answering` page is fully local and does not require API keys.
-- Use [DEMO_CHECKLIST.md](/Users/alvaro/Documents/GitHub/NLP_2/DEMO_CHECKLIST.md) for the 5-minute presentation flow.
